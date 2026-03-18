@@ -9,17 +9,11 @@ from fastapi import HTTPException, status
 from app.core.config import AI_MODEL
 
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/api")
-DEFAULT_MODEL = AI_MODEL or "qwen3:4b"
+DEFAULT_MODEL = AI_MODEL or "qwen3:1.7b"
 REQUEST_TIMEOUT_SECONDS = 600
 
 
 def _strip_code_fences(text: str) -> str:
-    """
-    Xóa markdown code fence nếu model trả kiểu:
-    ```json
-    {...}
-    ```
-    """
     text = text.strip()
 
     if text.startswith("```"):
@@ -31,20 +25,14 @@ def _strip_code_fences(text: str) -> str:
 
 
 def _extract_first_json_block(text: str) -> str:
-    """
-    Nếu model trả thêm lời giải thích ngoài JSON,
-    cố gắng lấy block JSON đầu tiên.
-    """
     text = _strip_code_fences(text)
 
-    # Thử parse trực tiếp trước
     try:
         json.loads(text)
         return text
     except Exception:
         pass
 
-    # Tìm object JSON đầu tiên
     match = re.search(r"\{.*\}", text, flags=re.DOTALL)
     if match:
         candidate = match.group(0).strip()
@@ -60,55 +48,7 @@ def _extract_first_json_block(text: str) -> str:
     )
 
 
-def _normalize_result(data: dict[str, Any]) -> dict[str, Any]:
-    """
-    Chuẩn hóa kết quả để summarize_service.py dùng ổn định.
-    """
-    if not isinstance(data, dict):
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Dữ liệu AI trả về không phải object JSON."
-        )
-
-    summary = data.get("summary", "")
-    main_points = data.get("main_points", [])
-
-    if not isinstance(summary, str):
-        summary = str(summary)
-
-    if not isinstance(main_points, list):
-        main_points = [str(main_points)]
-
-    normalized_points = []
-    for point in main_points:
-        point_str = str(point).strip()
-        if point_str:
-            normalized_points.append(point_str)
-
-    summary = summary.strip()
-
-    if not summary:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="AI không trả về summary hợp lệ."
-        )
-
-    if not normalized_points:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="AI không trả về main_points hợp lệ."
-        )
-
-    return {
-        "summary": summary,
-        "main_points": normalized_points[:5]
-    }
-
-
 def _post_to_ollama(payload: dict[str, Any]) -> dict[str, Any]:
-    """
-    Gửi request tới Ollama local API.
-    """
     url = f"{OLLAMA_BASE_URL}/chat"
 
     body = json.dumps(payload).encode("utf-8")
@@ -136,13 +76,10 @@ def _post_to_ollama(payload: dict[str, Any]) -> dict[str, Any]:
             detail=f"Ollama HTTPError {e.code}: {error_body or e.reason}"
         )
 
-    except error.URLError as e:
+    except error.URLError:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=(
-                "Không kết nối được tới Ollama. "
-                "Hãy kiểm tra Ollama đã chạy chưa và base URL có đúng không."
-            )
+            detail="Không kết nối được tới Ollama. Hãy kiểm tra Ollama đã chạy chưa."
         )
 
     except TimeoutError:
@@ -164,19 +101,7 @@ def _post_to_ollama(payload: dict[str, Any]) -> dict[str, Any]:
         )
 
 
-def call_ai_json(prompt: str) -> dict[str, Any]:
-    """
-    Hàm chính được summarize_service.py gọi.
-
-    Đầu vào:
-        prompt: prompt đã build sẵn từ summarize_service.py
-
-    Đầu ra mong muốn:
-        {
-            "summary": "...",
-            "main_points": ["...", "..."]
-        }
-    """
+def call_ai_raw_json(prompt: str) -> dict[str, Any]:
     if not prompt or not prompt.strip():
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -225,4 +150,57 @@ def call_ai_json(prompt: str) -> dict[str, Any]:
             detail="Không parse được JSON từ nội dung AI trả về."
         )
 
-    return _normalize_result(parsed)
+    if not isinstance(parsed, dict):
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="AI không trả về object JSON hợp lệ."
+        )
+
+    return parsed
+
+
+def _normalize_summary_result(data: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(data, dict):
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Dữ liệu AI trả về không phải object JSON."
+        )
+
+    summary = data.get("summary", "")
+    main_points = data.get("main_points", [])
+
+    if not isinstance(summary, str):
+        summary = str(summary)
+
+    if not isinstance(main_points, list):
+        main_points = [str(main_points)]
+
+    normalized_points = []
+    for point in main_points:
+        point_str = str(point).strip()
+        if point_str:
+            normalized_points.append(point_str)
+
+    summary = summary.strip()
+
+    if not summary:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="AI không trả về summary hợp lệ."
+        )
+
+    if not normalized_points:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="AI không trả về main_points hợp lệ."
+        )
+
+    return {
+        "summary": summary,
+        "main_points": normalized_points[:5]
+    }
+
+
+def call_ai_json(prompt: str) -> dict[str, Any]:
+    raw_data = call_ai_raw_json(prompt)
+    return _normalize_summary_result(raw_data)
